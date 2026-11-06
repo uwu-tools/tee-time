@@ -22,18 +22,24 @@ set -euo pipefail
 
 SCORECARD=${SCORECARD:-scorecard}
 AMPEL=${AMPEL:-ampel}
+BND=${BND:-bnd}
 POLICIES=https://raw.githubusercontent.com/carabiner-dev/policies/e0a2c0a55e711359e9ba786cf157f2267f71f9ed/scorecard
 : "${GITHUB_AUTH_TOKEN:?set GITHUB_AUTH_TOKEN}"
+for t in "$SCORECARD" "$AMPEL" "$BND" go curl; do
+  command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; exit 2; }
+done
 
+HERE=$(cd "$(dirname "$0")" && pwd)
 cd "$(mktemp -d)"
 
 for p in sast token-permissions code-review; do
   curl -fsSL -o "$p.hjson" "$POLICIES/$p.hjson"
 done
-# Local variants: enforce the advisory token-permissions policy, and
-# require the SAST check to be present in the evidence.
+# Local variants: enforce the advisory token-permissions policy, require
+# the SAST check to be present, and require a verified signature.
 sed '/enforce: "OFF"/d' token-permissions.hjson >token-permissions-enforced.hjson
 sed 's/outputs.sast.all(/size(outputs.sast) > 0 \&\& outputs.sast.all(/' sast.hjson >sast-require-present.hjson
+sed 's/code: "outputs.sast.all(/code: "predicates[0].verification.verified \&\& outputs.sast.all(/' sast.hjson >sast-require-signed.hjson
 
 # 1. Collect: one Scorecard run per repo, saved as an in-toto statement.
 collect() { # repo checks out
@@ -48,12 +54,20 @@ SC=$(commit scorecard.intoto.json)
 AS=$(commit allstar.intoto.json)
 [ -n "$SC" ] && [ -n "$AS" ] || { echo "no gitCommit in Scorecard output" >&2; exit 2; }
 
+# Sign the evidence with a throwaway key; a second key stands in for
+# anyone else.
+go run "$HERE/keygen.go" signer
+go run "$HERE/keygen.go" other
+"$BND" statement --signing-backend key -K signer.key --signing-timestamp=false \
+  -o scorecard.bundle.json scorecard.intoto.json
+
 # 2. Decide: AMPEL evaluates saved evidence offline; no repository token.
 failures=0
-check() { # name expected-exit subject evidence policy
-  local got=0
+check() { # name expected-exit subject evidence policy [public-key]
+  local got=0 key=()
+  [ -n "${6:-}" ] && key=(-k "$6")
   env -u GITHUB_AUTH_TOKEN "$AMPEL" verify --policy-verify=false -f summary \
-    --subject-hash "gitCommit:$3" -a "$4" -p "$5" >"$1.out" 2>&1 || got=$?
+    --subject-hash "gitCommit:$3" -a "$4" -p "$5" ${key[@]+"${key[@]}"} >"$1.out" 2>&1 || got=$?
   if { [ "$2" = 0 ] && [ "$got" = 0 ]; } || { [ "$2" != 0 ] && [ "$got" != 0 ]; }; then
     echo "ok   $1 (exit $got)"
   else
@@ -70,5 +84,11 @@ check wrong-subject 1 "$SC" allstar.intoto.json sast.hjson
 check missing-check 1 "$SC" license-only.intoto.json sast.hjson
 check missing-check-fixed 1 "$SC" license-only.intoto.json sast-require-present.hjson
 check pass-sast-fixed 0 "$SC" scorecard.intoto.json sast-require-present.hjson
+# Signatures: -a admits evidence whatever its signature, so a policy must
+# require one.
+check signed 0 "$SC" scorecard.bundle.json sast-require-signed.hjson signer.pub
+check signed-wrong-key 1 "$SC" scorecard.bundle.json sast-require-signed.hjson other.pub
+check unsigned 1 "$SC" scorecard.intoto.json sast-require-signed.hjson
+check signed-wrong-key-not-required 0 "$SC" scorecard.bundle.json sast.hjson other.pub
 
 exit "$failures"

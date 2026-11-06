@@ -12,6 +12,7 @@ code. Neither tool needs a change.
 ```sh
 go install github.com/ossf/scorecard/v5@v5.6.0
 go install github.com/policylabs/ampel/cmd/ampel@v1.5.0
+go install github.com/carabiner-dev/bnd@v0.4.7
 GITHUB_AUTH_TOKEN=<token> ./scorecard-ampel.sh
 ```
 
@@ -35,6 +36,16 @@ number of cases that didn't match.
 - `missing-check-fixed`, `pass-sast-fixed`: requiring the check to be
   present fixes it.
 
-Until #46 is resolved, the script exits 1.
+The last four cases sign the `ossf/scorecard` evidence with a throwaway
+key (`keygen.go`, signed with `bnd`) and check it with a policy that
+requires a verified signature:
 
-The evidence is unsigned; a real gate would verify a signed attestation.
+- `signed`: verified with the signer's public key; exit 0.
+- `signed-wrong-key`: verified with a different key; exit 1.
+- `unsigned`: the raw statement; exit 1.
+- `signed-wrong-key-not-required`: the upstream policy passes even with
+  the wrong key. AMPEL admits evidence passed with `-a` whatever its
+  signature, so the policy has to require one.
+
+Until #46 is resolved, the script exits 1. It exits 2 if a tool is
+missing or Scorecard returns no result.
